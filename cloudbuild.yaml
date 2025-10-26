@@ -1,0 +1,85 @@
+# Cloud Build configuration for n8n deployment
+# Triggers on GitHub push to deploy n8n to Cloud Run
+
+steps:
+  # Step 1: Install pnpm, dependencies, and build n8n
+  - name: 'node:22.21.0'
+    id: 'build-source'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "Installing pnpm..."
+        npm install -g pnpm@9.15.0
+
+        echo "Verifying pnpm installation..."
+        pnpm --version
+
+        echo "Installing dependencies..."
+        pnpm install --frozen-lockfile
+
+        echo "Building n8n for production deployment..."
+        NODE_ENV=production DOCKER_BUILD=true node scripts/ensure-zx.mjs && node scripts/build-n8n.mjs
+
+        echo "Build completed successfully"
+        ls -la compiled/
+
+  # Step 4: Build Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/n8n-images/n8n:v1'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/n8n-images/n8n:latest'
+      - '-f'
+      - 'docker/images/n8n/Dockerfile'
+      - '.'
+    waitFor: ['build-source']
+
+  # Step 5: Push Docker image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/n8n-images/n8n'
+    waitFor: ['build-docker']
+
+  # Step 6: Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-cloudrun'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'n8n'
+      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/n8n-images/n8n:latest'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--min-instances=1'
+      - '--max-instances=10'
+      - '--memory=2Gi'
+      - '--cpu=2'
+      - '--timeout=3600'
+      - '--port=8080'
+      - '--allow-unauthenticated'
+      - '--add-cloudsql-instances=n8n-server-448014:us-central1:n8n-db'
+      - '--set-env-vars=DB_TYPE=postgresdb,DB_POSTGRESDB_HOST=/cloudsql/n8n-server-448014:us-central1:n8n-db,DB_POSTGRESDB_PORT=5432,DB_POSTGRESDB_DATABASE=n8n,DB_POSTGRESDB_USER=n8n_user,NODE_ENV=production,N8N_PORT=8080,N8N_PROTOCOL=https,WEBHOOK_URL=https://n8n-$PROJECT_NUMBER-us-central1.run.app'
+      - '--set-secrets=DB_POSTGRESDB_PASSWORD=n8n-db-password:latest,N8N_ENCRYPTION_KEY=n8n-encryption-key:latest'
+      - '--service-account=n8n-service-account@n8n-server-448014.iam.gserviceaccount.com'
+    waitFor: ['push-docker']
+
+# Build configuration
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+
+# Artifact Registry images
+images:
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/n8n-images/n8n:v1'
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/n8n-images/n8n:latest'
+
+# Build timeout (30 minutes)
+timeout: 1800s
